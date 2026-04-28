@@ -1427,13 +1427,34 @@ func (r *RayServiceReconciler) applyServeTargetCapacity(ctx context.Context, ray
 		return err
 	}
 
-	// Check if ServeConfig requires update
-	if currentTargetCapacity, ok := serveConfig["target_capacity"].(float64); ok {
-		if int32(currentTargetCapacity) == goalTargetCapacity {
-			logger.Info("target_capacity already updated on RayCluster", "target_capacity", currentTargetCapacity)
-			// No update required, return early
-			return nil
-		}
+	// Check if ServeConfig requires update.
+	// NOTE: k8s.io/apimachinery/pkg/util/yaml.Unmarshal decodes all integers as
+	// int64 (not float64), regardless of whether the input is JSON or YAML.
+	// We therefore use a type switch to safely convert any numeric type to int32
+	// before comparing with goalTargetCapacity.
+	var currentTargetCapacity int32
+	hasCurrentValue := false
+	switch v := serveConfig["target_capacity"].(type) {
+	case float64:
+		currentTargetCapacity = int32(v)
+		hasCurrentValue = true
+	case float32:
+		currentTargetCapacity = int32(v)
+		hasCurrentValue = true
+	case int64:
+		currentTargetCapacity = int32(v)
+		hasCurrentValue = true
+	case int32:
+		currentTargetCapacity = v
+		hasCurrentValue = true
+	case int:
+		currentTargetCapacity = int32(v)
+		hasCurrentValue = true
+	}
+	if hasCurrentValue && currentTargetCapacity == goalTargetCapacity {
+		logger.Info("target_capacity already updated on RayCluster", "target_capacity", currentTargetCapacity)
+		// No update required, return early
+		return nil
 	}
 
 	serveConfig["target_capacity"] = goalTargetCapacity

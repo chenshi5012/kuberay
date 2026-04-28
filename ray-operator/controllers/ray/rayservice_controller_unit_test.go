@@ -2003,6 +2003,300 @@ func TestReconcileServeTargetCapacity(t *testing.T) {
 	}
 }
 
+// TestApplyServeTargetCapacity_Idempotency verifies that applyServeTargetCapacity
+// does NOT call UpdateDeployments when the cached target_capacity already equals
+// the goal value. This is the idempotency / skip-update path guarded by the
+// .(float64) type assertion on line 1431 of rayservice_controller.go.
+//
+// BUG PROOF: k8s.io/apimachinery/pkg/util/yaml.Unmarshal decodes ALL integers
+// as int64, never float64. Therefore the .(float64) assertion always fails,
+// the early-return is never reached, and UpdateDeployments is called on every
+// Reconcile even when nothing has changed.
+func TestApplyServeTargetCapacity_Idempotency(t *testing.T) {
+	features.SetFeatureGateDuringTest(t, features.RayServiceIncrementalUpgrade, true)
+
+	// Test Case 1: JSON integer format - mirrors what the controller writes back
+	// after a successful update (json.Marshal always emits integers without decimal
+	// point, e.g. {"target_capacity":30}).
+	t.Run("JSON integer: cached 30 == goal 30, must NOT call UpdateDeployments", func(t *testing.T) {
+		ctx := context.TODO()
+		rayService := &rayv1.RayService{
+			Spec: rayv1.RayServiceSpec{
+				UpgradeStrategy: &rayv1.RayServiceUpgradeStrategy{
+					Type: ptr.To(rayv1.RayServiceNewClusterWithIncrementalUpgrade),
+				},
+				ServeConfigV2: `{"target_capacity":30}`,
+			},
+			Status: rayv1.RayServiceStatuses{
+				ActiveServiceStatus: rayv1.RayServiceStatus{
+					RayClusterName: "active",
+					TargetCapacity: ptr.To(int32(30)),
+				},
+				PendingServiceStatus: rayv1.RayServiceStatus{
+					RayClusterName: "pending",
+					TargetCapacity: ptr.To(int32(70)),
+				},
+			},
+		}
+		rayCluster := &rayv1.RayCluster{ObjectMeta: metav1.ObjectMeta{Name: "active"}}
+		fakeDashboard := &utils.FakeRayDashboardClient{}
+		reconciler := &RayServiceReconciler{ServeConfigs: lru.New(10)}
+
+		err := reconciler.applyServeTargetCapacity(ctx, rayService, rayCluster, fakeDashboard, 30)
+		require.NoError(t, err)
+
+		// EXPECTED: UpdateDeployments must NOT be called (idempotent skip).
+		// ACTUAL with bug: UpdateDeployments IS called because .(float64) fails on int64.
+		assert.Empty(t, fakeDashboard.LastUpdatedConfig,
+			"BUG DETECTED: UpdateDeployments was called even though target_capacity is already 30. "+
+				"Root cause: yaml.Unmarshal returns int64, but code asserts .(float64).")
+	})
+
+	// Test Case 2: YAML format - the format users actually write in their
+	// RayService manifests (e.g. serveConfigV2: |\n  target_capacity: 30).
+	t.Run("YAML integer: cached target_capacity:30 == goal 30, must NOT call UpdateDeployments", func(t *testing.T) {
+		ctx := context.TODO()
+		rayService := &rayv1.RayService{
+			Spec: rayv1.RayServiceSpec{
+				UpgradeStrategy: &rayv1.RayServiceUpgradeStrategy{
+					Type: ptr.To(rayv1.RayServiceNewClusterWithIncrementalUpgrade),
+				},
+				ServeConfigV2: "target_capacity: 30",
+			},
+			Status: rayv1.RayServiceStatuses{
+				ActiveServiceStatus: rayv1.RayServiceStatus{
+					RayClusterName: "active",
+					TargetCapacity: ptr.To(int32(30)),
+				},
+				PendingServiceStatus: rayv1.RayServiceStatus{
+					RayClusterName: "pending",
+					TargetCapacity: ptr.To(int32(70)),
+				},
+			},
+		}
+		rayCluster := &rayv1.RayCluster{ObjectMeta: metav1.ObjectMeta{Name: "active"}}
+		fakeDashboard := &utils.FakeRayDashboardClient{}
+		reconciler := &RayServiceReconciler{ServeConfigs: lru.New(10)}
+
+		err := reconciler.applyServeTargetCapacity(ctx, rayService, rayCluster, fakeDashboard, 30)
+		require.NoError(t, err)
+
+		assert.Empty(t, fakeDashboard.LastUpdatedConfig,
+			"BUG DETECTED: UpdateDeployments was called even though target_capacity is already 30 (YAML format). "+
+				"Root cause: yaml.Unmarshal returns int64, but code asserts .(float64).")
+	})
+
+	// Test Case 3: Fully migrated state (100/0) - the steady state after a
+	// completed incremental upgrade. The controller should be completely silent.
+	t.Run("JSON integer: cached 100 == goal 100, must NOT call UpdateDeployments", func(t *testing.T) {
+		ctx := context.TODO()
+		rayService := &rayv1.RayService{
+			Spec: rayv1.RayServiceSpec{
+				UpgradeStrategy: &rayv1.RayServiceUpgradeStrategy{
+					Type: ptr.To(rayv1.RayServiceNewClusterWithIncrementalUpgrade),
+				},
+				ServeConfigV2: `{"target_capacity":100}`,
+			},
+			Status: rayv1.RayServiceStatuses{
+				ActiveServiceStatus: rayv1.RayServiceStatus{
+					RayClusterName: "active",
+					TargetCapacity: ptr.To(int32(100)),
+				},
+				PendingServiceStatus: rayv1.RayServiceStatus{
+					RayClusterName: "pending",
+					TargetCapacity: ptr.To(int32(0)),
+				},
+			},
+		}
+		rayCluster := &rayv1.RayCluster{ObjectMeta: metav1.ObjectMeta{Name: "active"}}
+		fakeDashboard := &utils.FakeRayDashboardClient{}
+		reconciler := &RayServiceReconciler{ServeConfigs: lru.New(10)}
+
+		err := reconciler.applyServeTargetCapacity(ctx, rayService, rayCluster, fakeDashboard, 100)
+		require.NoError(t, err)
+
+		assert.Empty(t, fakeDashboard.LastUpdatedConfig,
+			"BUG DETECTED: UpdateDeployments was called even though target_capacity is already 100. "+
+				"This causes unnecessary API churn in the fully-migrated steady state.")
+	})
+
+	// Test Case 4: Positive control - value DOES need to change (30 -> 50).
+	// UpdateDeployments MUST be called. This mirrors the official test cases
+	// and must continue to pass after the bug fix.
+	t.Run("Positive control: cached 30 != goal 50, MUST call UpdateDeployments", func(t *testing.T) {
+		ctx := context.TODO()
+		rayService := &rayv1.RayService{
+			Spec: rayv1.RayServiceSpec{
+				UpgradeStrategy: &rayv1.RayServiceUpgradeStrategy{
+					Type: ptr.To(rayv1.RayServiceNewClusterWithIncrementalUpgrade),
+				},
+				ServeConfigV2: `{"target_capacity":30}`,
+			},
+			Status: rayv1.RayServiceStatuses{
+				ActiveServiceStatus: rayv1.RayServiceStatus{
+					RayClusterName: "active",
+					TargetCapacity: ptr.To(int32(30)),
+				},
+				PendingServiceStatus: rayv1.RayServiceStatus{
+					RayClusterName: "pending",
+					TargetCapacity: ptr.To(int32(70)),
+				},
+			},
+		}
+		rayCluster := &rayv1.RayCluster{ObjectMeta: metav1.ObjectMeta{Name: "active"}}
+		fakeDashboard := &utils.FakeRayDashboardClient{}
+		reconciler := &RayServiceReconciler{ServeConfigs: lru.New(10)}
+
+		err := reconciler.applyServeTargetCapacity(ctx, rayService, rayCluster, fakeDashboard, 50)
+		require.NoError(t, err)
+
+		require.NotEmpty(t, fakeDashboard.LastUpdatedConfig,
+			"UpdateDeployments must be called when target_capacity changes (30 -> 50)")
+		assert.JSONEq(t, `{"target_capacity":50}`, string(fakeDashboard.LastUpdatedConfig))
+	})
+
+	// Test Case 5: Zero boundary - target_capacity=0 means "drain all traffic to this cluster".
+	// Zero is a valid and meaningful value; it must not be confused with "field absent".
+	// The fix must treat int64(0) == int32(0) and skip the update.
+	t.Run("Zero boundary: cached 0 == goal 0, must NOT call UpdateDeployments", func(t *testing.T) {
+		ctx := context.TODO()
+		rayService := &rayv1.RayService{
+			Spec: rayv1.RayServiceSpec{
+				UpgradeStrategy: &rayv1.RayServiceUpgradeStrategy{
+					Type: ptr.To(rayv1.RayServiceNewClusterWithIncrementalUpgrade),
+				},
+				ServeConfigV2: `{"target_capacity":0}`,
+			},
+			Status: rayv1.RayServiceStatuses{
+				ActiveServiceStatus: rayv1.RayServiceStatus{
+					RayClusterName: "active",
+					TargetCapacity: ptr.To(int32(0)),
+				},
+				PendingServiceStatus: rayv1.RayServiceStatus{
+					RayClusterName: "pending",
+					TargetCapacity: ptr.To(int32(100)),
+				},
+			},
+		}
+		rayCluster := &rayv1.RayCluster{ObjectMeta: metav1.ObjectMeta{Name: "active"}}
+		fakeDashboard := &utils.FakeRayDashboardClient{}
+		reconciler := &RayServiceReconciler{ServeConfigs: lru.New(10)}
+
+		err := reconciler.applyServeTargetCapacity(ctx, rayService, rayCluster, fakeDashboard, 0)
+		require.NoError(t, err)
+		assert.Empty(t, fakeDashboard.LastUpdatedConfig,
+			"UpdateDeployments must NOT be called when target_capacity is already 0 (drain state). "+
+				"Zero is a valid meaningful value indicating all traffic is drained from this cluster.")
+	})
+
+	// Test Case 6: No target_capacity field in ServeConfigV2.
+	// When the field is absent, hasCurrentValue remains false, so UpdateDeployments MUST be called.
+	// This ensures the fix does not accidentally skip updates when the field is missing.
+	t.Run("No target_capacity field: must call UpdateDeployments to inject it", func(t *testing.T) {
+		ctx := context.TODO()
+		rayService := &rayv1.RayService{
+			Spec: rayv1.RayServiceSpec{
+				UpgradeStrategy: &rayv1.RayServiceUpgradeStrategy{
+					Type: ptr.To(rayv1.RayServiceNewClusterWithIncrementalUpgrade),
+				},
+				// ServeConfigV2 intentionally has no target_capacity key.
+				ServeConfigV2: `{"applications":[{"name":"app1","import_path":"module.app"}]}`,
+			},
+			Status: rayv1.RayServiceStatuses{
+				ActiveServiceStatus: rayv1.RayServiceStatus{
+					RayClusterName: "active",
+					TargetCapacity: ptr.To(int32(0)),
+				},
+				PendingServiceStatus: rayv1.RayServiceStatus{
+					RayClusterName: "pending",
+					TargetCapacity: ptr.To(int32(100)),
+				},
+			},
+		}
+		rayCluster := &rayv1.RayCluster{ObjectMeta: metav1.ObjectMeta{Name: "active"}}
+		fakeDashboard := &utils.FakeRayDashboardClient{}
+		reconciler := &RayServiceReconciler{ServeConfigs: lru.New(10)}
+
+		err := reconciler.applyServeTargetCapacity(ctx, rayService, rayCluster, fakeDashboard, 50)
+		require.NoError(t, err)
+		require.NotEmpty(t, fakeDashboard.LastUpdatedConfig,
+			"UpdateDeployments must be called when target_capacity is absent from the cached config")
+	})
+
+	// Test Case 7: Rollback scenario - active cluster's target_capacity decreases (70 -> 30).
+	// During a rollback the active cluster's share is reduced as traffic shifts back.
+	// UpdateDeployments MUST be called with the new lower value.
+	t.Run("Rollback: cached 70 != goal 30, MUST call UpdateDeployments with new value", func(t *testing.T) {
+		ctx := context.TODO()
+		rayService := &rayv1.RayService{
+			Spec: rayv1.RayServiceSpec{
+				UpgradeStrategy: &rayv1.RayServiceUpgradeStrategy{
+					Type: ptr.To(rayv1.RayServiceNewClusterWithIncrementalUpgrade),
+				},
+				ServeConfigV2: `{"target_capacity":70}`,
+			},
+			Status: rayv1.RayServiceStatuses{
+				ActiveServiceStatus: rayv1.RayServiceStatus{
+					RayClusterName: "active",
+					TargetCapacity: ptr.To(int32(70)),
+				},
+				PendingServiceStatus: rayv1.RayServiceStatus{
+					RayClusterName: "pending",
+					TargetCapacity: ptr.To(int32(30)),
+				},
+			},
+		}
+		rayCluster := &rayv1.RayCluster{ObjectMeta: metav1.ObjectMeta{Name: "active"}}
+		fakeDashboard := &utils.FakeRayDashboardClient{}
+		reconciler := &RayServiceReconciler{ServeConfigs: lru.New(10)}
+
+		err := reconciler.applyServeTargetCapacity(ctx, rayService, rayCluster, fakeDashboard, 30)
+		require.NoError(t, err)
+		require.NotEmpty(t, fakeDashboard.LastUpdatedConfig,
+			"UpdateDeployments must be called during rollback when target_capacity decreases (70 -> 30)")
+		assert.JSONEq(t, `{"target_capacity":30}`, string(fakeDashboard.LastUpdatedConfig))
+	})
+
+	// Test Case 8: LRU cache hit - the ServeConfigs LRU cache holds the previously
+	// applied config string. applyServeTargetCapacity reads from the cache when the
+	// cache entry matches the cluster name. This test verifies that the type-switch
+	// fix works correctly for cache-sourced configs (not just ServeConfigV2).
+	t.Run("LRU cache hit: cached config from LRU equals goal, must NOT call UpdateDeployments", func(t *testing.T) {
+		ctx := context.TODO()
+		serveConfigs := lru.New(10)
+		// Pre-populate the LRU cache with the previously applied config.
+		// The cache key is the cluster name; the value is the applied config JSON string.
+		serveConfigs.Add("active", `{"target_capacity":60}`)
+		rayService := &rayv1.RayService{
+			Spec: rayv1.RayServiceSpec{
+				UpgradeStrategy: &rayv1.RayServiceUpgradeStrategy{
+					Type: ptr.To(rayv1.RayServiceNewClusterWithIncrementalUpgrade),
+				},
+				ServeConfigV2: `{"target_capacity":60}`,
+			},
+			Status: rayv1.RayServiceStatuses{
+				ActiveServiceStatus: rayv1.RayServiceStatus{
+					RayClusterName: "active",
+					TargetCapacity: ptr.To(int32(60)),
+				},
+				PendingServiceStatus: rayv1.RayServiceStatus{
+					RayClusterName: "pending",
+					TargetCapacity: ptr.To(int32(40)),
+				},
+			},
+		}
+		rayCluster := &rayv1.RayCluster{ObjectMeta: metav1.ObjectMeta{Name: "active"}}
+		fakeDashboard := &utils.FakeRayDashboardClient{}
+		reconciler := &RayServiceReconciler{ServeConfigs: serveConfigs}
+
+		err := reconciler.applyServeTargetCapacity(ctx, rayService, rayCluster, fakeDashboard, 60)
+		require.NoError(t, err)
+		assert.Empty(t, fakeDashboard.LastUpdatedConfig,
+			"UpdateDeployments must NOT be called when LRU cache shows target_capacity is already 60. "+
+				"The type-switch fix must handle int64 from cache-sourced configs too.")
+	})
+}
+
 // MakeGateway is a helper function to return an Gateway object
 func makeGateway(name, namespace string, isReady bool) *gwv1.Gateway {
 	status := metav1.ConditionFalse
